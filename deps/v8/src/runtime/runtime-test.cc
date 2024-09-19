@@ -25,6 +25,7 @@
 #include "src/execution/protectors-inl.h"
 #include "src/execution/tiering-manager.h"
 #include "src/flags/flags.h"
+#include "src/heap/heap-layout-inl.h"
 #include "src/heap/heap-write-barrier-inl.h"
 #include "src/heap/pretenuring-handler-inl.h"
 #include "src/ic/stub-cache.h"
@@ -373,7 +374,7 @@ Tagged<Object> OptimizeFunctionOnNextCall(RuntimeArguments& args,
     if (function->shared()->HasBaselineCode()) {
       code = function->shared()->baseline_code(kAcquireLoad);
     }
-    function->set_code(code);
+    function->UpdateCode(code);
   }
 
   TraceManualRecompile(*function, target_kind, concurrency_mode);
@@ -463,7 +464,7 @@ RUNTIME_FUNCTION(Runtime_BenchMaglev) {
   PrintF("Maglev compile time: %g ms!\n",
          timer.Elapsed().InMillisecondsF() / count);
 
-  function->set_code(*code);
+  function->UpdateMaybeContextSpecializedCode(isolate, *code);
 
   return ReadOnlyRoots(isolate).undefined_value();
 }
@@ -851,7 +852,7 @@ RUNTIME_FUNCTION(Runtime_NeverOptimizeFunction) {
     case CodeKind::INTERPRETED_FUNCTION:
       break;
     case CodeKind::BUILTIN:
-      if (InReadOnlySpace(*sfi)) {
+      if (HeapLayout::InReadOnlySpace(*sfi)) {
         // SFIs for builtin functions are in RO space and thus we cannot set
         // the never-optimize bit. But such SFIs cannot be optimized anyways.
         return CrashUnlessFuzzing(isolate);
@@ -1090,8 +1091,14 @@ void call_as_function(const v8::FunctionCallbackInfo<v8::Value>& info) {
 }  // namespace
 
 RUNTIME_FUNCTION(Runtime_GetAbstractModuleSource) {
+  // This isn't exposed to fuzzers. Crash if the native context is been
+  // modified.
   HandleScope scope(isolate);
-  return isolate->native_context()->abstract_module_source_function();
+  DisallowGarbageCollection no_gc;
+  Tagged<JSFunction> abstract_module_source_function =
+      isolate->native_context()->abstract_module_source_function();
+  CHECK(IsJSFunction(*abstract_module_source_function));
+  return abstract_module_source_function;
 }
 
 // Returns a callable object which redirects [[Call]] requests to
@@ -1520,7 +1527,7 @@ RUNTIME_FUNCTION(Runtime_DisassembleFunction) {
   Handle<JSFunction> func = args.at<JSFunction>(0);
   IsCompiledScope is_compiled_scope;
   if (!func->is_compiled(isolate) && func->HasAvailableOptimizedCode(isolate)) {
-    func->set_code(func->feedback_vector()->optimized_code(isolate));
+    func->UpdateCode(func->feedback_vector()->optimized_code(isolate));
   }
   CHECK(func->shared()->is_compiled() ||
         Compiler::Compile(isolate, func, Compiler::KEEP_EXCEPTION,
@@ -1625,7 +1632,7 @@ RUNTIME_FUNCTION(Runtime_InYoungGeneration) {
     return CrashUnlessFuzzing(isolate);
   }
   Tagged<Object> obj = args[0];
-  return isolate->heap()->ToBoolean(ObjectInYoungGeneration(obj));
+  return isolate->heap()->ToBoolean(HeapLayout::InYoungGeneration(obj));
 }
 
 // Force pretenuring for the allocation site the passed object belongs to.
@@ -2158,6 +2165,11 @@ RUNTIME_FUNCTION(Runtime_GetFeedback) {
     return CrashUnlessFuzzing(isolate);
   }
 
+#ifdef V8_JITLESS
+  // No feedback is collected in jitless mode, so tests calling %GetFeedback
+  // don't make sense.
+  return ReadOnlyRoots(isolate).undefined_value();
+#else
 #ifdef OBJECT_PRINT
   Handle<FeedbackVector> feedback_vector =
       handle(function->feedback_vector(), isolate);
@@ -2198,6 +2210,7 @@ RUNTIME_FUNCTION(Runtime_GetFeedback) {
 #else
   return ReadOnlyRoots(isolate).undefined_value();
 #endif  // OBJECT_PRINT
+#endif  // not V8_JITLESS
 }
 
 }  // namespace internal
